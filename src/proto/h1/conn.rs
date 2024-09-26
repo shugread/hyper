@@ -35,8 +35,11 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// The connection will determine when a message begins and ends as well as
 /// determine if this connection can be kept alive after the message,
 /// or if it is complete.
+/// 这将处理通过`Read + Write`(如套接字)建立的连接,并且可能包括通过 HTTP 的多个`Transaction`.
 pub(crate) struct Conn<I, B, T> {
+    // 封装IO操作,处理读取和写入数据.
     io: Buffered<I, EncodedBuf<B>>,
+    // 管理连接的状态
     state: State,
     _marker: PhantomData<fn(T)>,
 }
@@ -173,6 +176,7 @@ where
         self.state.is_write_closed()
     }
 
+    // 是否可以读取请求头
     pub(crate) fn can_read_head(&self) -> bool {
         if !matches!(self.state.reading, Reading::Init) {
             return false;
@@ -185,6 +189,7 @@ where
         !matches!(self.state.writing, Writing::Init)
     }
 
+    // 是否可以读取请求体
     pub(crate) fn can_read_body(&self) -> bool {
         matches!(
             self.state.reading,
@@ -192,6 +197,7 @@ where
         )
     }
 
+    // 是否初始化状态
     #[cfg(feature = "server")]
     pub(crate) fn has_initial_read_write_state(&self) -> bool {
         matches!(self.state.reading, Reading::Init)
@@ -204,11 +210,13 @@ where
         T::should_error_on_parse_eof() && !self.state.is_idle()
     }
 
+    // 检测客户端是否尝试使用HTTP/2协议
     fn has_h2_prefix(&self) -> bool {
         let read_buf = self.io.read_buf();
         read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
     }
 
+    // 读取请求头
     pub(super) fn poll_read_head(
         &mut self,
         cx: &mut Context<'_>,
@@ -228,6 +236,7 @@ where
                     }
                     None => {
                         trace!("setting h1 header read timeout timer");
+                        // 设置读取超时时间
                         self.state.h1_header_read_timeout_fut =
                             Some(self.state.timer.sleep_until(deadline));
                     }
@@ -258,6 +267,7 @@ where
                     if let Some(ref mut h1_header_read_timeout_fut) =
                         self.state.h1_header_read_timeout_fut
                     {
+                        // 请求头读取超时时间
                         if Pin::new(h1_header_read_timeout_fut).poll(cx).is_ready() {
                             self.state.h1_header_read_timeout_running = false;
 
@@ -273,6 +283,7 @@ where
 
         #[cfg(feature = "server")]
         {
+            // 清空超时时间
             self.state.h1_header_read_timeout_running = false;
             self.state.h1_header_read_timeout_fut = None;
         }
@@ -335,11 +346,13 @@ where
         Poll::Ready(Some(Ok((msg.head, msg.decode, wants))))
     }
 
+    // 读取请求头时发生错误
     fn on_read_head_error<Z>(&mut self, e: crate::Error) -> Poll<Option<crate::Result<Z>>> {
         // If we are currently waiting on a message, then an empty
         // message should be reported as an error. If not, it is just
         // the connection closing gracefully.
         let must_error = self.should_error_on_eof();
+        // 关闭读取
         self.close_read();
         self.io.consume_leading_lines();
         let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();
@@ -455,6 +468,7 @@ where
     //
     // This should only be called for Clients wanting to enter the idle
     // state.
+    // 检查以确保读取的 io 对象为空.
     fn require_empty_read(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         debug_assert!(!self.can_read_head() && !self.can_read_body() && !self.is_read_closed());
         debug_assert!(!self.is_mid_message());
@@ -507,6 +521,7 @@ where
         }
     }
 
+    // 强制进行一次IO读操作,如果发生错误则关闭连接
     fn force_io_read(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         debug_assert!(!self.state.is_read_closed());
 
@@ -565,6 +580,7 @@ where
         }
     }
 
+    // 在连接空闲时尝试保持连接活跃,这取决于 keep_alive 状态,如果不支持 keep_alive,连接将在完成请求后关闭.
     fn try_keep_alive(&mut self, cx: &mut Context<'_>) {
         self.state.try_keep_alive::<T>();
         self.maybe_notify(cx);
@@ -592,18 +608,23 @@ where
         self.io.can_buffer()
     }
 
+    // 将响应头写入连接
     pub(crate) fn write_head(&mut self, head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
         if let Some(encoder) = self.encode_head(head, body) {
             self.state.writing = if !encoder.is_eof() {
+                // 不是末尾
                 Writing::Body(encoder)
             } else if encoder.is_last() {
+                // 已经写入最后的数据, 关闭连接
                 Writing::Closed
             } else {
+                // 使用KeepAlive
                 Writing::KeepAlive
             };
         }
     }
 
+    // 编码head
     fn encode_head(
         &mut self,
         mut head: MessageHead<T::Outgoing>,
@@ -653,21 +674,25 @@ where
     }
 
     // Fix keep-alive when Connection: keep-alive header is not present
+    // 当 Connection: keep-alive 标头不存在时修复 keep-alive 问题
     fn fix_keep_alive(&mut self, head: &mut MessageHead<T::Outgoing>) {
         let outgoing_is_keep_alive = head
             .headers
             .get(CONNECTION)
             .map_or(false, connection_keep_alive);
 
+        // Connection没有keep-alive
         if !outgoing_is_keep_alive {
             match head.version {
                 // If response is version 1.0 and keep-alive is not present in the response,
                 // disable keep-alive so the server closes the connection
+                // 禁用 keep-alive
                 Version::HTTP_10 => self.state.disable_keep_alive(),
                 // If response is version 1.1 and keep-alive is wanted, add
                 // Connection: keep-alive header when not present
                 Version::HTTP_11 => {
                     if self.state.wants_keep_alive() {
+                        // 如果http1.1没有禁用keep-alive,添加keep-alive
                         head.headers
                             .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
                     }
@@ -679,9 +704,11 @@ where
 
     // If we know the remote speaks an older version, we try to fix up any messages
     // to work with our older peer.
+    // 如果知道客服端的版本,设置head的版本
     fn enforce_version(&mut self, head: &mut MessageHead<T::Outgoing>) {
         if let Version::HTTP_10 = self.state.version {
             // Fixes response or connection when keep-alive header is not present
+            // 当 keep-alive 标头不存在时修复响应或连接
             self.fix_keep_alive(head);
             // If the remote only knows HTTP/1.0, we should force ourselves
             // to do only speak HTTP/1.0 as well.
@@ -692,6 +719,7 @@ where
         // the user's headers be.
     }
 
+    // 写入响应
     pub(crate) fn write_body(&mut self, chunk: B) {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
         // empty chunks should be discarded at Dispatcher level
@@ -717,6 +745,7 @@ where
         self.state.writing = state;
     }
 
+    // 写入trailers
     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) {
         if T::is_server() && !self.state.allow_trailer_fields {
             debug!("trailers not allowed to be sent");
@@ -742,6 +771,7 @@ where
         }
     }
 
+    // 写入响应体
     pub(crate) fn write_body_and_end(&mut self, chunk: B) {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
         // empty chunks should be discarded at Dispatcher level
@@ -797,9 +827,11 @@ where
     //
     // - Client: there is nothing we can do
     // - Server: if Response hasn't been written yet, we can send a 4xx response
+    // 解析错误,检查http2
     fn on_parse_error(&mut self, err: crate::Error) -> crate::Result<()> {
         if let Writing::Init = self.state.writing {
             if self.has_h2_prefix() {
+                // 使用的http2
                 return Err(crate::Error::new_version_h2());
             }
             if let Some(msg) = T::on_error(&err) {
@@ -855,10 +887,12 @@ where
         }
     }
 
+    // 关闭读操作
     pub(crate) fn close_read(&mut self) {
         self.state.close_read();
     }
 
+    // 关闭写操作
     pub(crate) fn close_write(&mut self) {
         self.state.close_write();
     }
@@ -940,8 +974,10 @@ struct State {
     /// again. See the `maybe_notify` method for more.
     notify_read: bool,
     /// State of allowed reads
+    /// 用来标记当前连接的读状态
     reading: Reading,
     /// State of allowed writes
+    /// 用来标记当前连接的写状态
     writing: Writing,
     /// An expected pending HTTP upgrade.
     upgrade: Option<crate::upgrade::Pending>,

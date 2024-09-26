@@ -149,12 +149,15 @@ impl Decoder {
         trace!("decode; state={:?}", self.kind);
         match self.kind {
             Length(ref mut remaining) => {
+                // 没有剩余数据长度
                 if *remaining == 0 {
                     Poll::Ready(Ok(Frame::data(Bytes::new())))
                 } else {
                     let to_read = *remaining as usize;
+                    // 获取数据
                     let buf = ready!(body.read_mem(cx, to_read))?;
                     let num = buf.as_ref().len() as u64;
+                    // 提交数据长度
                     if num > *remaining {
                         *remaining = 0;
                     } else if num == 0 {

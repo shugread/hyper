@@ -108,6 +108,7 @@ impl Http1Transaction for Server {
     const LOG: &'static str = "{role=server}";
 
     fn parse(buf: &mut BytesMut, ctx: ParseContext<'_>) -> ParseResult<RequestLine> {
+        // buf不能为空
         debug_assert!(!buf.is_empty(), "parse called with empty buf");
 
         let mut keep_alive;
@@ -123,6 +124,8 @@ impl Http1Transaction for Server {
         // but we *never* read any of it until after httparse has assigned
         // values into it. By not zeroing out the stack memory, this saves
         // a good ~5% on pipeline benchmarks.
+        // 使用栈上空间加快速度, 请求头数量的最大值
+        // 请求头索引
         let mut headers_indices: SmallVec<[MaybeUninit<HeaderIndices>; DEFAULT_MAX_HEADERS]> =
             match ctx.h1_max_headers {
                 Some(cap) => smallvec![MaybeUninit::uninit(); cap],
@@ -137,6 +140,7 @@ impl Http1Transaction for Server {
             trace!(bytes = buf.len(), "Request.parse");
             let mut req = httparse::Request::new(&mut []);
             let bytes = buf.as_ref();
+            // 解析请求头
             match req.parse_with_uninit_headers(bytes, &mut headers) {
                 Ok(httparse::Status::Complete(parsed_len)) => {
                     trace!("Request.parse Complete({})", parsed_len);
@@ -184,6 +188,7 @@ impl Http1Transaction for Server {
             // TODO(lucab): switch to `Uri::from_shared()` once public.
             http::Uri::from_maybe_shared(uri_bytes)?
         };
+        // 请求行
         subject = RequestLine(method, uri);
 
         // According to https://tools.ietf.org/html/rfc7230#section-3.3.3
@@ -250,6 +255,7 @@ impl Http1Transaction for Server {
                     let len = headers::content_length_parse(&value)
                         .ok_or_else(Parse::content_length_invalid)?;
                     if let Some(prev) = con_len {
+                        // 多个不相等的Content-Length请求头将报错
                         if prev != len {
                             debug!(
                                 "multiple Content-Length headers with different values: [{}, {}]",
@@ -296,6 +302,7 @@ impl Http1Transaction for Server {
                 header_order.append(&name);
             }
 
+            // 添加请求头
             headers.append(name, value);
         }
 
@@ -350,6 +357,7 @@ impl Http1Transaction for Server {
         } else if msg.req_method == &Some(Method::CONNECT) && msg.head.subject.is_success() {
             // Sending content-length or transfer-encoding header on 2xx response
             // to CONNECT is forbidden in RFC 7231.
+            // RFC 7231 禁止在对 CONNECT 的 2xx 响应中发送内容长度(content-length)或传输编码标头.
             wrote_len = true;
             (Ok(()), true)
         } else if msg.head.subject.is_informational() {

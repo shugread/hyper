@@ -35,6 +35,7 @@ pin_project_lite::pin_project! {
     ///
     /// To drive HTTP on this connection this future **must be polled**, typically with
     /// `.await`. If it isn't polled, no progress will be made on this connection.
+    /// 一个与HttpService绑定的HTTP/1连接
     #[must_use = "futures do nothing unless polled"]
     pub struct Connection<T, S>
     where
@@ -67,18 +68,30 @@ pin_project_lite::pin_project! {
 ///
 /// Use [`Builder::serve_connection`](struct.Builder.html#method.serve_connection)
 /// to bind the built connection to a service.
+/// 用于配置HTTP/1连接的行为
 #[derive(Clone, Debug)]
 pub struct Builder {
     timer: Time,
+    // 是否支持半关闭(half-close).当客户端在发送请求后关闭写操作,
+    // 但仍然等待服务器响应时,如果设置为true,服务器不会立即关闭连接.
     h1_half_close: bool,
+    // 如果启用,服务器会保持连接,以便客户端可以复用连接进行多次请求.默认是true.
     h1_keep_alive: bool,
+    // 是否在发送HTTP响应时将头部字段名转换为标题大小写
     h1_title_case_headers: bool,
+    // 是否保留原始请求中的头部字段名大小写
     h1_preserve_header_case: bool,
+    // 设置请求头的最大数量
     h1_max_headers: Option<usize>,
+    // 读取客户端请求头的超时时间
     h1_header_read_timeout: Dur,
+    // 控制是否启用矢量写入
     h1_writev: Option<bool>,
+    // 设置连接的最大缓冲区大小
     max_buf_size: Option<usize>,
+    // 是否启用管道刷新
     pipeline_flush: bool,
+    // 是否自动在HTTP响应中添加Date头部
     date_header: bool,
 }
 
@@ -90,6 +103,7 @@ pub struct Builder {
 #[non_exhaustive]
 pub struct Parts<T, S> {
     /// The original IO object used in the handshake.
+    /// IO对象
     pub io: T,
     /// A buffer of bytes that have been read but not processed as HTTP.
     ///
@@ -99,8 +113,10 @@ pub struct Parts<T, S> {
     ///
     /// You will want to check for any existing bytes if you plan to continue
     /// communicating on the IO object.
+    /// 未处理的数据缓冲区
     pub read_buf: Bytes,
     /// The `Service` used to serve this connection.
+    /// 用于服务此连接的`服务`.
     pub service: S,
 }
 
@@ -133,6 +149,7 @@ where
     /// This should only be called while the `Connection` future is still
     /// pending. If called after `Connection::poll` has resolved, this does
     /// nothing.
+    /// 启动此连接的正常关闭过程.应继续轮询此`连接`,直到关闭可以完成.
     pub fn graceful_shutdown(mut self: Pin<&mut Self>) {
         self.conn.disable_keep_alive();
     }
@@ -162,6 +179,7 @@ where
     /// upgrade. Once the upgrade is completed, the connection would be "done",
     /// but it is not desired to actually shutdown the IO object. Instead you
     /// would take it back using `into_parts`.
+    /// 轮询连接是否完成,但不对底层 IO 调用`关闭`.
     pub fn poll_without_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>>
     where
         S: Unpin,
@@ -187,6 +205,7 @@ where
     /// Enable this connection to support higher-level HTTP upgrades.
     ///
     /// See [the `upgrade` module](crate::upgrade) for more.
+    /// 启用此连接以支持更高级别的 HTTP 升级.
     pub fn with_upgrades(self) -> UpgradeableConnection<I, S>
     where
         I: Send,
@@ -215,6 +234,7 @@ where
                         // upgrades here. In case a user was trying to use
                         // `Body::on_upgrade` with this API, send a special
                         // error letting them know about that.
+                        // 由于 `I` 上没有 `Send` 绑定,无法尝试在此处进行升级
                         pending.manual();
                     }
                 };
@@ -252,6 +272,7 @@ impl Builder {
     /// detects an EOF in the middle of a request.
     ///
     /// Default is `false`.
+    /// 启用或禁用半关闭
     pub fn half_close(&mut self, val: bool) -> &mut Self {
         self.h1_half_close = val;
         self
@@ -269,6 +290,7 @@ impl Builder {
     /// the socket level.
     ///
     /// Default is false.
+    /// 设置 HTTP/1 连接是否在套接字级别将请求头写为标题大写.
     pub fn title_case_headers(&mut self, enabled: bool) -> &mut Self {
         self.h1_title_case_headers = enabled;
         self
@@ -303,6 +325,7 @@ impl Builder {
     /// allocation will occur for each request, and there will be a performance drop of about 5%.
     ///
     /// Default is 100.
+    /// 最大请求头的数量
     pub fn max_headers(&mut self, val: usize) -> &mut Self {
         self.h1_max_headers = Some(val);
         self
@@ -317,6 +340,7 @@ impl Builder {
     /// Pass `None` to disable.
     ///
     /// Default is 30 seconds.
+    /// 请求头的读取超时时间
     pub fn header_read_timeout(&mut self, read_timeout: impl Into<Option<Duration>>) -> &mut Self {
         self.h1_header_read_timeout = Dur::Configured(read_timeout.into());
         self
@@ -334,6 +358,7 @@ impl Builder {
     ///
     /// Default is `auto`. In this mode hyper will try to guess which
     /// mode to use
+    /// /// 设置 HTTP/1 连接是否应该尝试使用矢量写入,或者始终展平到单个缓冲区.
     pub fn writev(&mut self, val: bool) -> &mut Self {
         self.h1_writev = Some(val);
         self
@@ -346,6 +371,7 @@ impl Builder {
     /// # Panics
     ///
     /// The minimum value allowed is 8192. This method panics if the passed `max` is less than the minimum.
+    /// 设置连接的最大缓冲区大小.
     pub fn max_buf_size(&mut self, max: usize) -> &mut Self {
         assert!(
             max >= proto::h1::MINIMUM_MAX_BUFFER_SIZE,
@@ -370,12 +396,14 @@ impl Builder {
     /// Experimental, may have bugs.
     ///
     /// Default is false.
+    /// 设置`date`标头是否应包含在 HTTP 响应中.
     pub fn pipeline_flush(&mut self, enabled: bool) -> &mut Self {
         self.pipeline_flush = enabled;
         self
     }
 
     /// Set the timer used in background tasks.
+    /// 设置后台任务使用的计时器.
     pub fn timer<M>(&mut self, timer: M) -> &mut Self
     where
         M: Timer + Send + Sync + 'static,
@@ -417,6 +445,7 @@ impl Builder {
     /// # }
     /// # fn main() {}
     /// ```
+    /// 将连接与 [`Service`](crate::service::Service) 绑定在一起.
     pub fn serve_connection<I, S>(&self, io: I, service: S) -> Connection<I, S>
     where
         S: HttpService<IncomingBody>,
@@ -469,6 +498,7 @@ impl Builder {
 }
 
 /// A future binding a connection with a Service with Upgrade support.
+/// 它的工作方式与普通的Connection类似,但能够处理客户端请求的协议切换(如WebSocket)
 #[must_use = "futures do nothing unless polled"]
 #[allow(missing_debug_implementations)]
 pub struct UpgradeableConnection<T, S>

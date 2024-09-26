@@ -152,6 +152,7 @@ where
         self.flush_pipeline || self.write_buf.can_buffer()
     }
 
+    // 去除头部的`\r`和`\n`
     pub(crate) fn consume_leading_lines(&mut self) {
         if !self.read_buf.is_empty() {
             let mut i = 0;
@@ -174,6 +175,7 @@ where
         S: Http1Transaction,
     {
         loop {
+            // 解析请求头
             match super::role::parse_headers::<S>(
                 &mut self.read_buf,
                 ParseContext {
@@ -208,6 +210,7 @@ where
         }
     }
 
+    // 读取数据
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         self.read_blocked = false;
         let next = self.read_buf_strategy.next();
@@ -219,6 +222,7 @@ where
         // bytes onto `dst`.
         let dst = unsafe { self.read_buf.chunk_mut().as_uninit_slice_mut() };
         let mut buf = ReadBuf::uninit(dst);
+        // 读取数据
         match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
             Poll::Ready(Ok(_)) => {
                 let n = buf.filled().len();

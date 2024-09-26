@@ -103,6 +103,7 @@ impl Incoming {
     /// Create a `Body` stream with an associated sender half.
     ///
     /// Useful when wanting to stream chunks from another thread.
+    // 创建新的通道
     #[inline]
     #[cfg(test)]
     pub(crate) fn channel() -> (Sender, Incoming) {
@@ -116,6 +117,7 @@ impl Incoming {
 
         // If wanter is true, `Sender::poll_ready()` won't becoming ready
         // until the `Body` has been polled for data once.
+        // 如果 wanter 为真,则 `Sender::poll_ready()` 将不会准备就绪,直到 `Incoming` 被轮询一次数据为止.
         let want = if wanter { WANT_PENDING } else { WANT_READY };
 
         let (want_tx, want_rx) = watch::channel(want);
@@ -157,6 +159,7 @@ impl Incoming {
     ) -> Self {
         // If the stream is already EOS, then the "unknown length" is clearly
         // actually ZERO.
+        // 如果流已经是 EOS,那么数据长度实际上是零.
         if !content_length.is_exact() && recv.is_end_stream() {
             content_length = DecodedLength::ZERO;
         }
@@ -207,25 +210,33 @@ impl Body for Incoming {
         )]
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // 空的body
         match self.kind {
             Kind::Empty => Poll::Ready(None),
             #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
+            // http1的通道
             Kind::Chan {
                 content_length: ref mut len,
                 ref mut data_rx,
                 ref mut want_tx,
                 ref mut trailers_rx,
             } => {
+                // 准备就绪,开始接收数据
                 want_tx.send(WANT_READY);
 
+                // 数据流没有关闭
                 if !data_rx.is_terminated() {
+                    // 获取数据
                     if let Some(chunk) = ready!(Pin::new(data_rx).poll_next(cx)?) {
+                        // 减小数据长度
                         len.sub_if(chunk.len() as u64);
+                        // 获取的数据
                         return Poll::Ready(Some(Ok(Frame::data(chunk))));
                     }
                 }
 
                 // check trailers after data is terminated
+                // 检查trailers
                 match ready!(Pin::new(trailers_rx).poll(cx)) {
                     Ok(t) => Poll::Ready(Some(Ok(Frame::trailers(t)))),
                     Err(_) => Poll::Ready(None),
@@ -238,9 +249,11 @@ impl Body for Incoming {
                 recv: ref mut h2,
                 content_length: ref mut len,
             } => {
+                // 没有完成
                 if !*data_done {
                     match ready!(h2.poll_data(cx)) {
                         Some(Ok(bytes)) => {
+                            // 轮询到数据,提交获取的数据长度
                             let _ = h2.flow_control().release_capacity(bytes.len());
                             len.sub_if(bytes.len() as u64);
                             ping.record_data(bytes.len());
@@ -250,6 +263,7 @@ impl Body for Incoming {
                             return match e.reason() {
                                 // These reasons should cause the body reading to stop, but not fail it.
                                 // The same logic as for `Read for H2Upgraded` is applied here.
+                                // 这些原因应该会导致body读取停止,但不会使其失败.
                                 Some(h2::Reason::NO_ERROR) | Some(h2::Reason::CANCEL) => {
                                     Poll::Ready(None)
                                 }
@@ -264,6 +278,7 @@ impl Body for Incoming {
                 }
 
                 // after data, check trailers
+                // 检查trailers
                 match ready!(h2.poll_trailers(cx)) {
                     Ok(t) => {
                         ping.record_non_data();
@@ -278,6 +293,7 @@ impl Body for Incoming {
         }
     }
 
+    // 数据流结束
     fn is_end_stream(&self) -> bool {
         match self.kind {
             Kind::Empty => true,
@@ -290,6 +306,7 @@ impl Body for Incoming {
         }
     }
 
+    // 数据长度
     fn size_hint(&self) -> SizeHint {
         #[cfg(all(
             any(feature = "http1", feature = "http2"),
@@ -349,6 +366,7 @@ impl fmt::Debug for Incoming {
 #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
 impl Sender {
     /// Check to see if this `Sender` can send more data.
+    /// 检查是否可以发送数据
     pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         // Check if the receiver end has tried polling for the body yet
         ready!(self.poll_want(cx)?);
@@ -357,6 +375,7 @@ impl Sender {
             .map_err(|_| crate::Error::new_closed())
     }
 
+    // 等待接收端接收数据
     fn poll_want(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         match self.want_rx.load(cx) {
             WANT_READY => Poll::Ready(Ok(())),
@@ -403,6 +422,7 @@ impl Sender {
     /// This is mostly useful for when trying to send from some other thread
     /// that doesn't have an async context. If in an async context, prefer
     /// `send_data()` instead.
+    /// 发送数据
     #[cfg(feature = "http1")]
     pub(crate) fn try_send_data(&mut self, chunk: Bytes) -> Result<(), Bytes> {
         self.data_tx
@@ -410,6 +430,7 @@ impl Sender {
             .map_err(|err| err.into_inner().expect("just sent Ok"))
     }
 
+    // 发送trailers
     #[cfg(feature = "http1")]
     pub(crate) fn try_send_trailers(
         &mut self,
@@ -428,6 +449,7 @@ impl Sender {
         self.send_error(crate::Error::new_body_write_aborted());
     }
 
+    // 发送关闭状态
     pub(crate) fn send_error(&mut self, err: crate::Error) {
         let _ = self
             .data_tx

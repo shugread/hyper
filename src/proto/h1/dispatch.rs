@@ -32,13 +32,17 @@ pub(crate) trait Dispatch {
     type PollBody;
     type PollError;
     type RecvItem;
+    // 异步轮询下一个要发送的消息
     fn poll_msg(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), Self::PollError>>>;
+    // 接收传入的消息
     fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, IncomingBody)>)
         -> crate::Result<()>;
+    // 检查调度器是否准备好处理新请求
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
+    // 决定是否需要继续轮询消息
     fn should_poll(&self) -> bool;
 }
 
@@ -120,6 +124,7 @@ where
         })
     }
 
+    // 捕获错误,如果dispatch处理了错误, 将正常返回
     fn poll_catch(
         &mut self,
         cx: &mut Context<'_>,
@@ -134,6 +139,7 @@ where
             // We just try to give the error to the user,
             // and close the connection with an Ok. If we
             // cannot give it to the user, then return the Err.
+            //
             self.dispatch.recv_msg(Err(e))?;
             Ok(Dispatched::Shutdown)
         }))
@@ -144,15 +150,18 @@ where
         cx: &mut Context<'_>,
         should_shutdown: bool,
     ) -> Poll<crate::Result<Dispatched>> {
+        // 更新Date头的数据
         T::update_date();
 
         ready!(self.poll_loop(cx))?;
 
         if self.is_done() {
             if let Some(pending) = self.conn.pending_upgrade() {
-                self.conn.take_error()?;
+                // 连接升级,如切换成Websocket
+                self.conn.take_error()?; // 检查有没有错误
                 return Poll::Ready(Ok(Dispatched::Upgrade(pending)));
             } else if should_shutdown {
+                // 关闭连接
                 ready!(self.conn.poll_shutdown(cx)).map_err(crate::Error::new_shutdown)?;
             }
             self.conn.take_error()?;
@@ -162,12 +171,15 @@ where
         }
     }
 
+    // 轮询任务
     fn poll_loop(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         // Limit the looping on this connection, in case it is ready far too
         // often, so that other futures don't starve.
         //
         // 16 was chosen arbitrarily, as that is number of pipelined requests
         // benchmarks often use. Perhaps it should be a config option instead.
+        // 限制此连接的循环,以防它过于频繁地准备就绪,影响其他Future的就绪.
+        // 16是基于性能测试设置的
         for _ in 0..16 {
             let _ = self.poll_read(cx)?;
             let _ = self.poll_write(cx)?;
@@ -181,6 +193,10 @@ where
             //
             // Using this instead of task::current() and notify() inside
             // the Conn is noticeably faster in pipelined benchmarks.
+            //
+            // 如果读取在 IO 阻塞之前暂停(例如到达帧消息的末尾),但随后写入/刷新将状态设置回 Init,则可能会发生这种情况.
+            // 在这种情况下,如果读取缓冲区仍有字节,我们会想再次尝试 poll_read,否则我们将永远不会再次被唤醒.
+            // 在流水线基准测试中,在 Conn 中使用此方法代替 task::current() 和 notify() 会明显更快.
             if !self.conn.wants_read_again() {
                 //break;
                 return Poll::Ready(Ok(()));
@@ -194,12 +210,16 @@ where
 
     fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         loop {
+            // 判断关闭状态
             if self.is_closing {
                 return Poll::Ready(Ok(()));
             } else if self.conn.can_read_head() {
+                // 读取请求头
                 ready!(self.poll_read_head(cx))?;
             } else if let Some(mut body) = self.body_tx.take() {
+                // 判断是否可以读取body
                 if self.conn.can_read_body() {
+                    // 检查body是否可读
                     match body.poll_ready(cx) {
                         Poll::Ready(Ok(())) => (),
                         Poll::Pending => {
@@ -214,16 +234,19 @@ where
                             continue;
                         }
                     }
+                    // 读取body
                     match self.conn.poll_read_body(cx) {
                         Poll::Ready(Some(Ok(frame))) => {
                             if frame.is_data() {
                                 let chunk = frame.into_data().unwrap_or_else(|_| unreachable!());
+                                // 发送读取到的body
                                 match body.try_send_data(chunk) {
                                     Ok(()) => {
                                         self.body_tx = Some(body);
                                     }
                                     Err(_canceled) => {
                                         if self.conn.can_read_body() {
+                                            // body的接收者已经关闭
                                             trace!("body receiver dropped before eof, closing");
                                             self.conn.close_read();
                                         }
@@ -268,8 +291,10 @@ where
         }
     }
 
+    // 读取请求头
     fn poll_read_head(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         // can dispatch receive, or does it still care about other incoming message?
+        // 是否可以接收消息,如果已经开始处理请求,将始终pendding
         match ready!(self.dispatch.poll_ready(cx)) {
             Ok(()) => (),
             Err(()) => {
@@ -280,9 +305,11 @@ where
         }
 
         // dispatch is ready for a message, try to read one
+        // 读取请求头
         match ready!(self.conn.poll_read_head(cx)) {
             Some(Ok((mut head, body_len, wants))) => {
                 let body = match body_len {
+                    // 空body
                     DecodedLength::ZERO => IncomingBody::empty(),
                     other => {
                         let (tx, rx) =
@@ -292,6 +319,7 @@ where
                     }
                 };
                 if wants.contains(Wants::UPGRADE) {
+                    // 协议升级
                     let upgrade = self.conn.on_upgrade();
                     debug_assert!(!upgrade.is_none(), "empty upgrade");
                     debug_assert!(
@@ -300,10 +328,12 @@ where
                     );
                     head.extensions.insert(upgrade);
                 }
+                // 使用处理程序处理
                 self.dispatch.recv_msg(Ok((head, body)))?;
                 Poll::Ready(Ok(()))
             }
             Some(Err(err)) => {
+                // 请求头读取失败
                 debug!("read_head error: {}", err);
                 self.dispatch.recv_msg(Err(err))?;
                 // if here, the dispatcher gave the user the error
@@ -316,6 +346,7 @@ where
                 // read eof, the write side will have been closed too unless
                 // allow_read_close was set to true, in which case just do
                 // nothing...
+                // 写入端也将被关闭
                 debug_assert!(self.conn.is_read_closed());
                 if self.conn.is_write_closed() {
                     self.close();
@@ -327,12 +358,14 @@ where
 
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         loop {
+            // 判断是否关闭
             if self.is_closing {
                 return Poll::Ready(Ok(()));
             } else if self.body_rx.is_none()
                 && self.conn.can_write_head()
                 && self.dispatch.should_poll()
             {
+                // 推动dispatcher处理请求
                 if let Some(msg) = ready!(Pin::new(&mut self.dispatch).poll_msg(cx)) {
                     let (head, body) = msg.map_err(crate::Error::new_user_service)?;
 
@@ -345,11 +378,13 @@ where
                             .exact()
                             .map(BodyLength::Known)
                             .or(Some(BodyLength::Unknown));
+                        // 响应体的大小
                         self.body_rx.set(Some(body));
                         btype
                     };
                     self.conn.write_head(head, body_type);
                 } else {
+                    // 没有返回值
                     self.close();
                     return Poll::Ready(Ok(()));
                 }
@@ -361,6 +396,7 @@ where
                     OptGuard::new(self.body_rx.as_mut()).guard_mut()
                 {
                     debug_assert!(!*clear_body, "opt guard defaults to keeping body");
+                    // 不能写入body
                     if !self.conn.can_write_body() {
                         trace!(
                             "no more write body allowed, user body is_end_stream = {}",
@@ -370,6 +406,7 @@ where
                         continue;
                     }
 
+                    // 轮询响应帧
                     let item = ready!(body.as_mut().poll_frame(cx));
                     if let Some(item) = item {
                         let frame = item.map_err(|e| {
@@ -378,9 +415,11 @@ where
                         })?;
 
                         if frame.is_data() {
+                            // 响应帧是数据
                             let chunk = frame.into_data().unwrap_or_else(|_| unreachable!());
                             let eos = body.is_end_stream();
                             if eos {
+                                // 判断是否是流的末尾
                                 *clear_body = true;
                                 if chunk.remaining() == 0 {
                                     trace!("discarding empty chunk");
@@ -396,6 +435,7 @@ where
                                 self.conn.write_body(chunk);
                             }
                         } else if frame.is_trailers() {
+                            // 写入trailers
                             *clear_body = true;
                             self.conn.write_trailers(
                                 frame.into_trailers().unwrap_or_else(|_| unreachable!()),
@@ -529,12 +569,14 @@ cfg_server! {
         type PollError = S::Error;
         type RecvItem = RequestHead;
 
+        // 轮询in_flight
         fn poll_msg(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
         ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), Self::PollError>>> {
             let mut this = self.as_mut();
             let ret = if let Some(ref mut fut) = this.in_flight.as_mut().as_pin_mut() {
+                // 获取到的结果
                 let resp = ready!(fut.as_mut().poll(cx)?);
                 let (parts, body) = resp.into_parts();
                 let head = MessageHead {
@@ -549,6 +591,7 @@ cfg_server! {
             };
 
             // Since in_flight finished, remove it
+            // 清空in_flight
             this.in_flight.set(None);
             ret
         }
